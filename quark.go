@@ -1,51 +1,73 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (c) 2024 Elastic NV
+// Copyright (c) 2024-2026 Elastic NV
 
 //go:build linux && (amd64 || arm64)
 
 package quark
 
 /*
-   #cgo CFLAGS: -I${SRCDIR}/include
-   #cgo amd64 LDFLAGS: -Wl,--wrap=fmemopen ${SRCDIR}/libquark_big_amd64.a
-   #cgo arm64 LDFLAGS: -Wl,--wrap=fmemopen ${SRCDIR}/libquark_big_arm64.a
+#cgo CFLAGS: -I${SRCDIR}/include
+#cgo amd64 LDFLAGS: -Wl,--wrap=fmemopen ${SRCDIR}/libquark_big_amd64.a
+#cgo arm64 LDFLAGS: -Wl,--wrap=fmemopen ${SRCDIR}/libquark_big_arm64.a
 
-   #include <stdlib.h>
-   #include "quark.h"
+#include <errno.h>
+#include <stdlib.h>
+#include <string.h>
+#include "quark.h"
 
-   #ifdef __x86_64__
-   __asm__(".symver fmemopen, fmemopen@GLIBC_2.2.5");
-   #elif __aarch64__
-   __asm__(".symver fmemopen, fmemopen@GLIBC_2.17");
-   #else
-   #error Add correct desired symbol version for your arch
-   #endif
+#ifdef __x86_64__
+__asm__(".symver fmemopen, fmemopen@GLIBC_2.2.5");
+#elif __aarch64__
+__asm__(".symver fmemopen, fmemopen@GLIBC_2.17");
+#else
+#error Add correct desired symbol version for your arch
+#endif
 
-   FILE *
-   __wrap_fmemopen(void *buf, size_t size, const char *mode)
-   {
-     return fmemopen(buf, size, mode);
-   }
+FILE *
+__wrap_fmemopen(void *buf, size_t size, const char *mode)
+{
+	return fmemopen(buf, size, mode);
+}
 
-   static int
-   get_event_as_ecs(struct quark_queue *qq, char **ecs_buf, size_t *ecs_buf_len)
-   {
-     const struct quark_event	*qev;
+static int
+get_event_as_ecs(struct quark_queue *qq, char **ecs_buf, size_t *ecs_buf_len)
+{
+	const struct quark_event	*qev;
 
-     *ecs_buf = NULL;
+	*ecs_buf = NULL;
 
-     qev = quark_queue_get_event(qq);
-     if (qev == NULL)
-       return (0);
+	qev = quark_queue_get_event(qq);
+	if (qev == NULL)
+		return (0);
 
-     if (quark_event_to_ecs(qq, qev, ecs_buf, ecs_buf_len) == -1) {
-       *ecs_buf = NULL;
-       return (-1);
-     }
+	if (quark_event_to_ecs(qq, qev, ecs_buf, ecs_buf_len) == -1) {
+		*ecs_buf = NULL;
+		return (-1);
+	}
 
-     return (0);
+	return (0);
 
-  }
+}
+
+static int
+ruleset_from_string(struct quark_ruleset *ruleset, const char *s,
+    char *err_buf, size_t err_buf_len)
+{
+	FILE	*in;
+	int	 r;
+
+	if ((in = fmemopen((void *)s, strlen(s), "r")) == NULL) {
+		snprintf(err_buf, err_buf_len, "fmemopen: %s",
+		    strerror(errno));
+		return (-1);
+	}
+
+	r = quark_ruleset_parse(ruleset, in, err_buf, err_buf_len);
+
+	fclose(in);
+
+	return (r);
+}
 */
 import "C"
 
@@ -97,14 +119,15 @@ type Exit struct {
 
 // Process represents a single process.
 type Process struct {
-	Pid     uint32 // Always present
-	Proc    Proc   // Only meaningful if Proc.Valid (QUARK_F_PROC)
-	Exit    Exit   // Only meaningful if Exit.Valid (QUARK_F_EXIT)
-	Comm    string
-	Exe     string
-	Cmdline []string
-	Cwd     string
-	Cgroup  string
+	Pid       uint32 // Always present
+	Proc      Proc   // Only meaningful if Proc.Valid (QUARK_F_PROC)
+	Exit      Exit   // Only meaningful if Exit.Valid (QUARK_F_EXIT)
+	Comm      string
+	Exe       string
+	Cmdline   []string
+	Cwd       string
+	Cgroup    string
+	PoisonTag uint64 // Set by matching poison rules, zero if none matched
 }
 
 // Socket represents a connection between two endpoints
@@ -137,7 +160,8 @@ type File struct {
 	Mode      uint32
 	Uid       uint32
 	Gid       uint32
-	OpMask    uint32
+	OpMask     uint32
+	ChangeMask uint32
 }
 
 type Ptrace struct {
@@ -198,7 +222,8 @@ type Event struct {
 
 // Queue holds the state of a quark instance.
 type Queue struct {
-	quarkQueue *C.struct_quark_queue // pointer to the queue structure
+	quarkQueue *C.struct_quark_queue   // pointer to the queue structure
+	ruleset    *C.struct_quark_ruleset // active ruleset, nil if none
 	epollFd    int
 }
 
@@ -217,21 +242,21 @@ const (
 	QQ_TTY           = int(C.QQ_TTY)
 	QQ_PTRACE        = int(C.QQ_PTRACE)
 	QQ_MODULE_LOAD   = int(C.QQ_MODULE_LOAD)
-	QQ_ALL_BACKENDS  = int(C.QQ_ALL_BACKENDS)
 
 	// Event.events
-	QUARK_EV_FORK             = uint64(C.QUARK_EV_FORK)
-	QUARK_EV_EXEC             = uint64(C.QUARK_EV_EXEC)
-	QUARK_EV_EXIT             = uint64(C.QUARK_EV_EXIT)
-	QUARK_EV_SETPROCTITLE     = uint64(C.QUARK_EV_SETPROCTITLE)
-	QUARK_EV_SOCK_CONN_CLOSED = uint64(C.QUARK_EV_SOCK_CONN_CLOSED)
-	QUARK_EV_PACKET           = uint64(C.QUARK_EV_PACKET)
-	QUARK_EV_BYPASS           = uint64(C.QUARK_EV_BYPASS)
-	QUARK_EV_FILE             = uint64(C.QUARK_EV_FILE)
-	QUARK_EV_PTRACE           = uint64(C.QUARK_EV_PTRACE)
-	QUARK_EV_MODULE_LOAD      = uint64(C.QUARK_EV_MODULE_LOAD)
-	QUARK_EV_SHM              = uint64(C.QUARK_EV_SHM)
-	QUARK_EV_TTY              = uint64(C.QUARK_EV_TTY)
+	QUARK_EV_FORK                  = uint64(C.QUARK_EV_FORK)
+	QUARK_EV_EXEC                  = uint64(C.QUARK_EV_EXEC)
+	QUARK_EV_EXIT                  = uint64(C.QUARK_EV_EXIT)
+	QUARK_EV_SETPROCTITLE          = uint64(C.QUARK_EV_SETPROCTITLE)
+	QUARK_EV_SOCK_CONN_ESTABLISHED = uint64(C.QUARK_EV_SOCK_CONN_ESTABLISHED)
+	QUARK_EV_SOCK_CONN_CLOSED      = uint64(C.QUARK_EV_SOCK_CONN_CLOSED)
+	QUARK_EV_PACKET                = uint64(C.QUARK_EV_PACKET)
+	QUARK_EV_BYPASS                = uint64(C.QUARK_EV_BYPASS)
+	QUARK_EV_FILE                  = uint64(C.QUARK_EV_FILE)
+	QUARK_EV_PTRACE                = uint64(C.QUARK_EV_PTRACE)
+	QUARK_EV_MODULE_LOAD           = uint64(C.QUARK_EV_MODULE_LOAD)
+	QUARK_EV_SHM                   = uint64(C.QUARK_EV_SHM)
+	QUARK_EV_TTY                   = uint64(C.QUARK_EV_TTY)
 
 	// EntryLeaderType
 	QUARK_ELT_UNKNOWN   = int(C.QUARK_ELT_UNKNOWN)
@@ -248,6 +273,12 @@ const (
 	QUARK_FILE_OP_MODIFY = uint32(C.QUARK_FILE_OP_MODIFY)
 	QUARK_FILE_OP_REMOVE = uint32(C.QUARK_FILE_OP_REMOVE)
 	QUARK_FILE_OP_MOVE   = uint32(C.QUARK_FILE_OP_MOVE)
+
+	// File.ChangeMask
+	QUARK_FILE_CH_CONTENT = uint32(C.QUARK_FILE_CH_CONTENT)
+	QUARK_FILE_CH_PERMS   = uint32(C.QUARK_FILE_CH_PERMS)
+	QUARK_FILE_CH_OWNER   = uint32(C.QUARK_FILE_CH_OWNER)
+	QUARK_FILE_CH_XATTRS  = uint32(C.QUARK_FILE_CH_XATTRS)
 
 	// MemFd.Kind
 	QUARK_SHM_MEMFD_CREATE = int(C.QUARK_SHM_MEMFD_CREATE)
@@ -269,6 +300,10 @@ type QueueAttr struct {
 	MaxLength      int
 	CacheGraceTime int
 	HoldTime       int
+	// RuleText is a ruleset in the rule DSL, parsed and installed on
+	// the queue by OpenQueue. Empty means no rules. Processes matched
+	// by poison rules carry the tag in Process.PoisonTag.
+	RuleText string
 }
 
 // Documented in https://elastic.github.io/quark/quark_queue_get_stats.3.html.
@@ -312,6 +347,38 @@ func DefaultQueueAttr() QueueAttr {
 	}
 }
 
+// rulesetFromText parses text in the rule DSL into a C-allocated
+// ruleset, which the caller owns and must release with freeRuleset.
+func rulesetFromText(text string) (*C.struct_quark_ruleset, error) {
+	p, err := C.calloc(C.size_t(1), C.sizeof_struct_quark_ruleset)
+	if p == nil {
+		return nil, wrapErrno(err)
+	}
+	ruleset := (*C.struct_quark_ruleset)(p)
+
+	ctext := C.CString(text)
+	defer C.free(unsafe.Pointer(ctext))
+	errBuf := make([]byte, 1024)
+
+	if C.ruleset_from_string(ruleset, ctext,
+		(*C.char)(unsafe.Pointer(&errBuf[0])), C.size_t(len(errBuf))) != 0 {
+		freeRuleset(ruleset)
+		errStr := string(errBuf)
+		if nul := bytes.IndexByte(errBuf, 0); nul != -1 {
+			errStr = string(errBuf[:nul])
+		}
+		return nil, fmt.Errorf("can't parse ruleset: %s", errStr)
+	}
+
+	return ruleset, nil
+}
+
+// freeRuleset releases a ruleset allocated by rulesetFromText.
+func freeRuleset(ruleset *C.struct_quark_ruleset) {
+	C.quark_ruleset_clear(ruleset)
+	C.free(unsafe.Pointer(ruleset))
+}
+
 // OpenQueue opens a Quark Queue with the given attributes.
 func OpenQueue(attr QueueAttr) (*Queue, error) {
 	var queue Queue
@@ -319,8 +386,20 @@ func OpenQueue(attr QueueAttr) (*Queue, error) {
 
 	C.quark_queue_default_attr(&cattr)
 
+	if attr.RuleText != "" {
+		ruleset, err := rulesetFromText(attr.RuleText)
+		if err != nil {
+			return nil, err
+		}
+		queue.ruleset = ruleset
+		cattr.ruleset = ruleset
+	}
+
 	p, err := C.calloc(C.size_t(1), C.sizeof_struct_quark_queue)
 	if p == nil {
+		if queue.ruleset != nil {
+			freeRuleset(queue.ruleset)
+		}
 		return nil, wrapErrno(err)
 	}
 	queue.quarkQueue = (*C.struct_quark_queue)(p)
@@ -332,6 +411,9 @@ func OpenQueue(attr QueueAttr) (*Queue, error) {
 	ok, err := C.quark_queue_open(queue.quarkQueue, &cattr)
 	if ok == -1 {
 		C.free(unsafe.Pointer(queue.quarkQueue))
+		if queue.ruleset != nil {
+			freeRuleset(queue.ruleset)
+		}
 		return nil, wrapErrno(err)
 	}
 
@@ -345,6 +427,10 @@ func (queue *Queue) Close() {
 	C.quark_queue_close(queue.quarkQueue)
 	C.free(unsafe.Pointer(queue.quarkQueue))
 	queue.quarkQueue = nil
+	if queue.ruleset != nil {
+		freeRuleset(queue.ruleset)
+		queue.ruleset = nil
+	}
 }
 
 func (queue *Queue) GetEvent() (Event, bool) {
@@ -464,6 +550,34 @@ func SetVerbose(level int) {
 	C.quark_verbose = C.int(level)
 }
 
+// UpdateBoottime refetches the boottime epoch used by TimeToWallclock.
+// Call it when the system clock might have been stepped, as when NTP
+// corrects a clock that was wrong at boot.
+func UpdateBoottime() error {
+	ret, err := C.quark_update_boottime()
+	if ret == -1 {
+		return wrapErrno(err)
+	}
+
+	return nil
+}
+
+// Boottime returns the boottime epoch used by TimeToWallclock: the
+// wallclock time of boot in nanoseconds since the Unix epoch, zero
+// before the first queue is opened.
+func Boottime() uint64 {
+	return uint64(C.quark_get_boottime())
+}
+
+// TimeToWallclock translates timeSinceBoot from nanoseconds since boot,
+// as in Proc.TimeBoot, Exit.ExitTimeProcess, Socket.EstablishedTime and
+// Socket.CloseTime, to nanoseconds since the Unix epoch. Times since
+// boot are immune to system clock changes; translate at the last moment
+// and keep the epoch fresh with UpdateBoottime.
+func TimeToWallclock(timeSinceBoot uint64) uint64 {
+	return uint64(C.quark_time_to_wallclock(C.u64(timeSinceBoot)))
+}
+
 // processFromC converts the C process structure to a go process.
 func processFromC(cProcess *C.struct_quark_process) Process {
 	var process Process
@@ -524,6 +638,7 @@ func processFromC(cProcess *C.struct_quark_process) Process {
 	if cProcess.cgroup != nil {
 		process.Cgroup = C.GoString(cProcess.cgroup)
 	}
+	process.PoisonTag = uint64(cProcess.poison_tag)
 
 	return process
 }
@@ -588,6 +703,7 @@ func fileFromC(cFile *C.struct_quark_file) File {
 	file.Uid = uint32(cFile.uid)
 	file.Gid = uint32(cFile.gid)
 	file.OpMask = uint32(cFile.op_mask)
+	file.ChangeMask = uint32(cFile.change_mask)
 
 	return file
 }

@@ -1,11 +1,11 @@
 /* SPDX-License-Identifier: Apache-2.0 */
-/* Copyright (c) 2024 Elastic NV */
+/* Copyright (c) 2024-2026 Elastic NV */
 
 #ifndef _QUARK_H_
 #define _QUARK_H_
 
 /* Version is shared between library and utilities */
-#define QUARK_VERSION "0.6"
+#define QUARK_VERSION "0.8a"
 
 /* Misc types */
 #include <sys/socket.h>
@@ -62,6 +62,9 @@ int			 quark_queue_get_epollfd(struct quark_queue *);
 void			 quark_queue_get_stats(struct quark_queue *,
 			     struct quark_queue_stats *);
 int			 quark_start_kube_talker(const char *, pid_t *);
+int			 quark_update_boottime(void);
+u64			 quark_get_boottime(void);
+u64			 quark_time_to_wallclock(u64);
 int			 quark_dump_process_cache_graph(struct quark_queue *,
 			     FILE *);
 int			 quark_dump_raw_event_graph(struct quark_queue *,
@@ -110,7 +113,7 @@ int			 quark_can_aggregate_tty(struct quark_queue *,
 			     struct raw_event *, struct raw_event *);
 
 /* quark.c: These are exported for testing only */
-int	 kube_parse_cgroup(const char *, char *, size_t);
+int	 parse_container_cgroup(const char *, char *, size_t);
 
 /* btf.c */
 struct quark_btf_target {
@@ -366,6 +369,11 @@ struct raw_packet {
 #define QUARK_FILE_OP_REMOVE	(1 << 2)
 #define QUARK_FILE_OP_MOVE	(1 << 3)
 
+#define QUARK_FILE_CH_CONTENT	(1 << 0)
+#define QUARK_FILE_CH_PERMS	(1 << 1)
+#define QUARK_FILE_CH_OWNER	(1 << 2)
+#define QUARK_FILE_CH_XATTRS	(1 << 3)
+
 struct quark_file {
 	const char	*path;		/* points to storage + 0 */
 	const char	*old_path;	/* NULL or points to storage + strlen(path) */
@@ -379,6 +387,7 @@ struct quark_file {
 	u32		 uid;
 	u32		 gid;
 	u32		 op_mask;	/* mask of QUARK_FILE_OP_* */
+	u32		 change_mask;	/* mask of QUARK_FILE_CH_* */
 	char		 storage[];	/* paths point here */
 };
 
@@ -401,6 +410,7 @@ struct quark_module_load {
 	char *name;
 	char *version;
 	char *src_version;
+	u64   taints;
 };
 
 struct raw_module_load {
@@ -680,7 +690,8 @@ struct quark_container {
 	RB_ENTRY(quark_container)	 entry_qkube;	/* our ""global"" linkage */
 	RB_ENTRY(quark_container)	 entry_pod;	/* our linkage inside a quark_pod */
 	TAILQ_HEAD(, quark_process)	 processes;	/* processes in this container */
-	int				 linked;	/* both entries are linked */
+	int				 linked_by_id;	/* linked in container_id tree */
+	int				 linked_by_pod;	/* linked in pod tree */
 	char				*container_id;	/* unique id */
 	struct quark_pod		*pod;		/* backpointer to owner */
 	char				*name;
@@ -747,7 +758,6 @@ struct quark_kube {
 	size_t			 buf_len;		/* total length */
 	struct quark_kube_node	 node;			/* node we're running on */
 	struct pod_by_uid	 pod_by_uid;		/* uid comes from json */
-	struct container_by_id	 container_by_id;	/* in containerID format from json */
 };
 
 /*
@@ -883,7 +893,11 @@ struct quark_queue_attr {
 #define QQ_MODULE_LOAD		(1 << 12)
 #define QQ_GETPID		(1 << 13)
 #define QQ_NOVA			(1 << 14)
-#define QQ_ALL_BACKENDS		(QQ_KPROBE | QQ_EBPF)	/* QQ_NOVA excluded for now */
+/*
+ * Informational only, not configuration: if set, event times are
+ * CLOCK_MONOTONIC, else CLOCK_BOOTTIME.
+ */
+#define QQ_MONOTONIC		(1 << 15)
 	int			 flags;
 	int			 max_length;
 	int			 cache_grace_time;	/* in ms */
@@ -905,6 +919,7 @@ struct quark_queue {
 	struct socket_by_src_dst	 socket_by_src_dst;
 	struct passwd_by_uid		 passwd_by_uid;
 	struct group_by_gid		 group_by_gid;
+	struct container_by_id		 container_by_id;	/* all known containers */
 	struct quark_sysinfo		 sysinfo;
 	struct quark_event		 event_storage;
 	struct quark_queue_stats	 stats;
