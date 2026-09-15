@@ -5,7 +5,7 @@
 #define _QUARK_H_
 
 /* Version is shared between library and utilities */
-#define QUARK_VERSION "0.8"
+#define QUARK_VERSION "0.9a"
 
 /* Misc types */
 #include <sys/socket.h>
@@ -227,6 +227,10 @@ int	quark_event_to_ecs(struct quark_queue *qq,
 #define MS_TO_NS(_x)	((u64)(_x) * NS_PER_MS)
 #endif /* MS_TO_NS */
 
+#ifndef TS_TO_NS
+#define TS_TO_NS(_ts) ((u64)(_ts).tv_sec * NS_PER_S + (u64)(_ts).tv_nsec)
+#endif /* TS_TO_NS */
+
 #ifndef NS_TO_S
 #define NS_TO_S(_x)	((u64)(_x) / NS_PER_S)
 #endif /* NS_TO_S */
@@ -255,6 +259,7 @@ enum raw_types {
 	RAW_SHM,
 	RAW_TTY,
 	RAW_GETPID,
+	RAW_MPROTECT,
 	RAW_NUM_TYPES		/* must be last */
 };
 
@@ -402,8 +407,29 @@ struct quark_ptrace {
 	u64	data;
 };
 
+/*
+ * One executable attempt observed at security_file_mprotect(). The hook runs
+ * before the kernel commits the protection change and can fire once per VMA.
+ */
+struct quark_mprotect {
+	u64	vma_start;	/* VMA containing the attempted change */
+	u64	vma_end;
+	u64	prev_prot;	/* normalized PROT_READ/WRITE/EXEC bits */
+	u64	req_prot;	/* protection requested by userspace */
+	u64	effective_prot;	/* kernel-adjusted protection */
+	u64	inode;		/* zero for anonymous mappings */
+	u32	dev_major;	/* zero for anonymous mappings */
+	u32	dev_minor;	/* zero for anonymous mappings */
+	u32	file_backed;
+	char   *path;		/* mount-ns relative; NULL for anonymous */
+};
+
 struct raw_ptrace {
 	struct quark_ptrace quark_ptrace;
+};
+
+struct raw_mprotect {
+	struct quark_mprotect quark_mprotect;
 };
 
 struct quark_module_load {
@@ -478,6 +504,7 @@ struct raw_event {
 		struct raw_packet		packet;
 		struct raw_file			file;
 		struct raw_ptrace		ptrace;
+		struct raw_mprotect		mprotect;
 		struct raw_module_load		module_load;
 		struct raw_shm			shm;
 		struct raw_tty			tty;
@@ -514,6 +541,7 @@ struct quark_event {
 #define QUARK_EV_SHM			(1 << 12)
 #define QUARK_EV_TTY			(1 << 13)
 #define QUARK_EV_GETPID			(1 << 14)
+#define QUARK_EV_MPROTECT		(1 << 15)
 	u64				 events;
 	u64				 time;
 	const struct quark_process	*process;
@@ -522,6 +550,7 @@ struct quark_event {
 	const void			*bypass;
 	struct quark_file		*file;
 	struct quark_ptrace		 ptrace;
+	struct quark_mprotect		 mprotect;
 	struct quark_module_load	*module_load;
 	struct quark_shm		*shm;
 	struct quark_tty		*tty;
@@ -866,8 +895,9 @@ struct quark_queue_stats {
 	u64	non_aggregations;
 	u64	lost;
 	u64	garbage_collections;
-	int	backend;	/* active backend, QQ_EBPF or QQ_KPROBE */
-	/* TODO u64	peak_nodes; */
+	u64	stalls;     /* stalled perf rings due to corruption, only for QQ_KPROBE */
+	int	backend;    /* active backend, QQ_EBPF or QQ_KPROBE */
+	/* TODO u64    peak_nodes; */
 };
 
 struct quark_queue_ops {
@@ -893,11 +923,7 @@ struct quark_queue_attr {
 #define QQ_MODULE_LOAD		(1 << 12)
 #define QQ_GETPID		(1 << 13)
 #define QQ_NOVA			(1 << 14)
-/*
- * Informational only, not configuration: if set, event times are
- * CLOCK_MONOTONIC, else CLOCK_BOOTTIME.
- */
-#define QQ_MONOTONIC		(1 << 15)
+#define QQ_MPROTECT		(1 << 15)
 	int			 flags;
 	int			 max_length;
 	int			 cache_grace_time;	/* in ms */
