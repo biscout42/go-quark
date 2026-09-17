@@ -5,7 +5,7 @@
 #define _QUARK_H_
 
 /* Version is shared between library and utilities */
-#define QUARK_VERSION "0.8"
+#define QUARK_VERSION "0.9a"
 
 /* Misc types */
 #include <sys/socket.h>
@@ -84,6 +84,19 @@ const struct quark_socket *quark_socket_lookup(struct quark_queue *,
 			     struct quark_sockaddr *, struct quark_sockaddr *);
 struct quark_passwd	*quark_passwd_lookup(struct quark_queue *, uid_t);
 struct quark_group	*quark_group_lookup(struct quark_queue *, gid_t);
+struct quark_pod	*quark_pod_get(struct quark_queue *, const char *);
+const struct quark_pod	*quark_pod_lookup(struct quark_queue *, const char *);
+struct quark_container	*quark_container_get(struct quark_queue *,
+			     const char *, const char *);
+const struct quark_container *quark_container_lookup(struct quark_queue *,
+			     const char *);
+struct quark_pod	*quark_pod_create(struct quark_queue *, const char *,
+			     const char *, const char *, const char *);
+struct quark_container	*quark_container_create(struct quark_queue *,
+			     const char *, const char *, const char *,
+			     const char *);
+int			 quark_pod_remove(struct quark_queue *, const char *);
+int			 quark_container_remove(struct quark_queue *, const char *);
 void			 quark_ruleset_init(struct quark_ruleset *);
 void			 quark_ruleset_clear(struct quark_ruleset *);
 int			 quark_ruleset_parse(struct quark_ruleset *, FILE *,
@@ -113,7 +126,12 @@ int			 quark_can_aggregate_tty(struct quark_queue *,
 			     struct raw_event *, struct raw_event *);
 
 /* quark.c: These are exported for testing only */
-int	 parse_container_cgroup(const char *, char *, size_t);
+void		 quark_queue_init_bare(struct quark_queue *);
+int		 parse_container_cgroup(const char *, char *, size_t);
+const char	*process_container_id(struct quark_process *);
+void		 process_set_cgroup(struct quark_process *, char **);
+void		 link_container_data(struct quark_queue *,
+		     struct quark_process *);
 
 /* btf.c */
 struct quark_btf_target {
@@ -227,6 +245,10 @@ int	quark_event_to_ecs(struct quark_queue *qq,
 #define MS_TO_NS(_x)	((u64)(_x) * NS_PER_MS)
 #endif /* MS_TO_NS */
 
+#ifndef TS_TO_NS
+#define TS_TO_NS(_ts) ((u64)(_ts).tv_sec * NS_PER_S + (u64)(_ts).tv_nsec)
+#endif /* TS_TO_NS */
+
 #ifndef NS_TO_S
 #define NS_TO_S(_x)	((u64)(_x) / NS_PER_S)
 #endif /* NS_TO_S */
@@ -255,6 +277,7 @@ enum raw_types {
 	RAW_SHM,
 	RAW_TTY,
 	RAW_GETPID,
+	RAW_MPROTECT,
 	RAW_NUM_TYPES		/* must be last */
 };
 
@@ -402,8 +425,29 @@ struct quark_ptrace {
 	u64	data;
 };
 
+/*
+ * One executable attempt observed at security_file_mprotect(). The hook runs
+ * before the kernel commits the protection change and can fire once per VMA.
+ */
+struct quark_mprotect {
+	u64	vma_start;	/* VMA containing the attempted change */
+	u64	vma_end;
+	u64	prev_prot;	/* normalized PROT_READ/WRITE/EXEC bits */
+	u64	req_prot;	/* protection requested by userspace */
+	u64	effective_prot;	/* kernel-adjusted protection */
+	u64	inode;		/* zero for anonymous mappings */
+	u32	dev_major;	/* zero for anonymous mappings */
+	u32	dev_minor;	/* zero for anonymous mappings */
+	u32	file_backed;
+	char   *path;		/* mount-ns relative; NULL for anonymous */
+};
+
 struct raw_ptrace {
 	struct quark_ptrace quark_ptrace;
+};
+
+struct raw_mprotect {
+	struct quark_mprotect quark_mprotect;
 };
 
 struct quark_module_load {
@@ -478,6 +522,7 @@ struct raw_event {
 		struct raw_packet		packet;
 		struct raw_file			file;
 		struct raw_ptrace		ptrace;
+		struct raw_mprotect		mprotect;
 		struct raw_module_load		module_load;
 		struct raw_shm			shm;
 		struct raw_tty			tty;
@@ -514,6 +559,7 @@ struct quark_event {
 #define QUARK_EV_SHM			(1 << 12)
 #define QUARK_EV_TTY			(1 << 13)
 #define QUARK_EV_GETPID			(1 << 14)
+#define QUARK_EV_MPROTECT		(1 << 15)
 	u64				 events;
 	u64				 time;
 	const struct quark_process	*process;
@@ -522,6 +568,7 @@ struct quark_event {
 	const void			*bypass;
 	struct quark_file		*file;
 	struct quark_ptrace		 ptrace;
+	struct quark_mprotect		 mprotect;
 	struct quark_module_load	*module_load;
 	struct quark_shm		*shm;
 	struct quark_tty		*tty;
@@ -567,6 +614,7 @@ enum gc_type {
 	GC_PROCESS,
 	GC_SOCKET,
 	GC_POD,
+	GC_CONTAINER,
 };
 
 struct gc_link {
@@ -576,9 +624,10 @@ struct gc_link {
 };
 
 /*
- * gc queue, after processes or sockets are are marked for deletion, they still
- * get a grace time of qq->cache_grace_time before removal, this is to allow
- * lookups from users on processes and sockets that have just vanished.
+ * gc queue, after processes, sockets, pods or containers are marked for
+ * deletion, they still get a grace time of qq->cache_grace_time before removal,
+ * this is to allow lookups from users on objects that have just vanished.
+ * Marking is final, nothing unmarks an object once it is in the queue.
  */
 TAILQ_HEAD(gc_queue, gc_link);
 
@@ -594,6 +643,7 @@ struct quark_process {
 	TAILQ_ENTRY(quark_process)	entry_container;
 	/* Always present */
 	u32	 pid;
+	u32	 container_id_parsed;	/* cgroup was parsed into container_id */
 
 #define QUARK_F_PROC		(1 << 0)
 #define QUARK_F_EXIT		(1 << 1)
@@ -635,6 +685,7 @@ struct quark_process {
 	char	*cmdline;
 	char	*cwd;
 	char	*cgroup;
+	char	*container_id;
 	struct quark_container *container;
 	char	*env;
 	size_t	 env_len;
@@ -684,9 +735,13 @@ RB_HEAD(label_tree, label_node);
 RB_PROTOTYPE(label_tree, label_node, entry, label_node_cmp);
 
 /*
- * A container's lifecycle is tied to its parent quark_pod.
+ * A container is removed when its parent quark_pod is removed, or on its own
+ * through quark_container_remove(). Either way it stays valid for the gc grace
+ * time and is then freed, possibly while its pod is still alive. A container
+ * without a pod has a NULL pod backpointer.
  */
 struct quark_container {
+	struct gc_link			 gc;		/* must be first */
 	RB_ENTRY(quark_container)	 entry_qkube;	/* our ""global"" linkage */
 	RB_ENTRY(quark_container)	 entry_pod;	/* our linkage inside a quark_pod */
 	TAILQ_HEAD(, quark_process)	 processes;	/* processes in this container */
@@ -703,10 +758,9 @@ struct quark_container {
 };
 
 /*
- * A quark_pod holds multiple containters in pod_containters.
- * The same containers are also linked in containters_by_id inside quark_kube.
- * This is to allow a search by container_id, which then can follow the pod
- * backpointer, to finally find the pod of a containter_id.
+ * A quark_pod holds its containers in pod_containers.
+ * All containers are indexed by container_id in quark_queue, including those
+ * without a pod. A container's pod backpointer identifies its parent, if any.
  */
 RB_HEAD(pod_containers, quark_container);
 RB_HEAD(container_by_id, quark_container);
@@ -728,7 +782,7 @@ struct quark_pod {
 };
 
 /*
- * A quark_pod indexed by uid, this is the main data structure for quark_kube{}.
+ * Pods indexed by uid in quark_queue.
  */
 RB_HEAD(pod_by_uid, quark_pod);
 
@@ -757,7 +811,6 @@ struct quark_kube {
 	size_t			 buf_r;			/* read pointer */
 	size_t			 buf_len;		/* total length */
 	struct quark_kube_node	 node;			/* node we're running on */
-	struct pod_by_uid	 pod_by_uid;		/* uid comes from json */
 };
 
 /*
@@ -866,8 +919,9 @@ struct quark_queue_stats {
 	u64	non_aggregations;
 	u64	lost;
 	u64	garbage_collections;
-	int	backend;	/* active backend, QQ_EBPF or QQ_KPROBE */
-	/* TODO u64	peak_nodes; */
+	u64	stalls;     /* stalled perf rings due to corruption, only for QQ_KPROBE */
+	int	backend;    /* active backend, QQ_EBPF or QQ_KPROBE */
+	/* TODO u64    peak_nodes; */
 };
 
 struct quark_queue_ops {
@@ -893,11 +947,7 @@ struct quark_queue_attr {
 #define QQ_MODULE_LOAD		(1 << 12)
 #define QQ_GETPID		(1 << 13)
 #define QQ_NOVA			(1 << 14)
-/*
- * Informational only, not configuration: if set, event times are
- * CLOCK_MONOTONIC, else CLOCK_BOOTTIME.
- */
-#define QQ_MONOTONIC		(1 << 15)
+#define QQ_MPROTECT		(1 << 15)
 	int			 flags;
 	int			 max_length;
 	int			 cache_grace_time;	/* in ms */
@@ -920,6 +970,7 @@ struct quark_queue {
 	struct passwd_by_uid		 passwd_by_uid;
 	struct group_by_gid		 group_by_gid;
 	struct container_by_id		 container_by_id;	/* all known containers */
+	struct pod_by_uid		 pod_by_uid;		/* all known pods */
 	struct quark_sysinfo		 sysinfo;
 	struct quark_event		 event_storage;
 	struct quark_queue_stats	 stats;
